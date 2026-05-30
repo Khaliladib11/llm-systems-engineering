@@ -39,19 +39,9 @@ Inspired by virtual memory in operating systems:
 
 ### Continuous Batching
 
-Traditional batching waits for all requests in a batch to finish before starting new ones:
+Traditional batching waits for all requests in a batch to finish before starting new ones — short requests waste GPU time waiting for long ones to complete.
 
-```
-[req1 ████████████] 
-[req2 ████]         ← req2 finishes early, GPU sits idle until req1 finishes
-```
-
-Continuous batching inserts new requests as slots free up:
-
-```
-[req1 ████████████]
-[req2 ████][req3 ████████]  ← req3 starts immediately when req2 finishes
-```
+Continuous batching inserts new requests into free slots as soon as any request finishes, keeping the GPU busy at all times.
 
 ### Tensor Parallelism in Inference
 
@@ -93,6 +83,15 @@ SGLang uses a **radix tree** to cache KV entries keyed by token prefixes:
 - Requests sharing the same prefix (e.g., the same system prompt) share the cached KV blocks
 - Huge speedup for multi-turn conversations and RAG workloads with repeated context
 
+### Key Metrics to Track
+
+| Metric | What it Measures | Target |
+|--------|-----------------|--------|
+| TTFT (Time to First Token) | Prefill latency | < 500 ms for interactive use |
+| TPOT (Time Per Output Token) | Decode latency per token | < 30 ms/token |
+| Throughput | Total tokens/sec across all requests | Maximise for batch workloads |
+| GPU memory utilisation | KV cache + model weights | 85–95% |
+
 ---
 
 ## Hands-On Tasks
@@ -105,74 +104,6 @@ SGLang uses a **radix tree** to cache KV entries keyed by token prefixes:
 - [ ] Implement a simple load test script (concurrent requests, measure latency percentiles)
 - [ ] Enable **speculative decoding** in vLLM (use a small draft model)
 - [ ] Experiment with different `max_num_seqs` and `gpu_memory_utilization` settings
-
----
-
-## Key Code Patterns
-
-### Launch vLLM Server
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model meta-llama/Llama-3-8B-Instruct \
-  --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.9 \
-  --max-num-seqs 256 \
-  --port 8000
-```
-
-### vLLM with Speculative Decoding
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model meta-llama/Llama-3-8B-Instruct \
-  --speculative-model meta-llama/Llama-3-1B \
-  --num-speculative-tokens 5
-```
-
-### Load Test Script
-
-```python
-import asyncio
-import time
-import httpx
-
-async def single_request(client: httpx.AsyncClient, prompt: str) -> dict:
-    """Send a single generation request and return timing info."""
-    start = time.perf_counter()
-    response = await client.post(
-        "http://localhost:8000/v1/completions",
-        json={"model": "meta-llama/Llama-3-8B-Instruct", "prompt": prompt, "max_tokens": 100},
-        timeout=60.0,
-    )
-    elapsed = time.perf_counter() - start
-    data = response.json()
-    tokens = data["usage"]["completion_tokens"]
-    return {"latency": elapsed, "tokens_per_sec": tokens / elapsed}
-
-async def load_test(concurrency: int, num_requests: int) -> None:
-    """Run a concurrent load test against the vLLM server."""
-    prompt = "Explain the attention mechanism in transformers."
-    async with httpx.AsyncClient() as client:
-        tasks = [single_request(client, prompt) for _ in range(num_requests)]
-        results = await asyncio.gather(*tasks)
-    latencies = [r["latency"] for r in results]
-    latencies.sort()
-    print(f"p50: {latencies[len(latencies)//2]:.2f}s")
-    print(f"p95: {latencies[int(len(latencies)*0.95)]:.2f}s")
-    print(f"p99: {latencies[int(len(latencies)*0.99)]:.2f}s")
-
-asyncio.run(load_test(concurrency=32, num_requests=200))
-```
-
-### Key Metrics to Track
-
-| Metric | What it Measures | Target |
-|--------|-----------------|--------|
-| TTFT (Time to First Token) | Prefill latency | < 500 ms for interactive use |
-| TPOT (Time Per Output Token) | Decode latency per token | < 30 ms/token |
-| Throughput | Total tokens/sec across all requests | Maximise for batch workloads |
-| GPU memory utilisation | KV cache + model weights | 85–95% |
 
 ---
 

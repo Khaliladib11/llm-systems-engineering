@@ -71,6 +71,16 @@ PyTorch's native alternative to DeepSpeed ZeRO Stage 3:
 - Configure via `accelerate config` CLI — generates a YAML file
 - Supports DeepSpeed JSON configs passed via the YAML config
 
+### When to Use Which Strategy
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Model fits on one GPU, want faster training | Data parallel (DDP) |
+| Model fits per GPU with Stage 1/2 | ZeRO Stage 2 — best performance/complexity trade-off |
+| Model does not fit even with Stage 2 | ZeRO Stage 3 or FSDP |
+| Prefer PyTorch-native, no DeepSpeed dependency | FSDP |
+| Very large models (70B+) across many nodes | Pipeline + tensor parallelism (Megatron-LM) |
+
 ---
 
 ## Hands-On Tasks
@@ -83,64 +93,6 @@ PyTorch's native alternative to DeepSpeed ZeRO Stage 3:
 - [ ] Profile a training step using `torch.profiler` — identify bottlenecks
 - [ ] Implement proper **checkpoint saving and resuming** from mid-training
 - [ ] Benchmark: tokens/second across different ZeRO stages and GPU counts
-
----
-
-## Key Code Patterns
-
-### DeepSpeed ZeRO Stage 2 Config (`ds_config.json`)
-
-```json
-{
-  "zero_optimization": {
-    "stage": 2,
-    "allgather_partitions": true,
-    "allgather_bucket_size": 2e8,
-    "overlap_comm": true,
-    "reduce_scatter": true,
-    "reduce_bucket_size": 2e8,
-    "contiguous_gradients": true
-  },
-  "bf16": { "enabled": true },
-  "train_batch_size": "auto",
-  "train_micro_batch_size_per_gpu": "auto",
-  "gradient_accumulation_steps": "auto"
-}
-```
-
-### Accelerate Training Script Skeleton
-
-```python
-from accelerate import Accelerator
-
-accelerator = Accelerator(gradient_accumulation_steps=4)
-
-model, optimiser, train_dataloader, scheduler = accelerator.prepare(
-    model, optimiser, train_dataloader, scheduler
-)
-
-for batch in train_dataloader:
-    with accelerator.accumulate(model):
-        outputs = model(**batch)
-        loss = outputs.loss
-        accelerator.backward(loss)
-        optimiser.step()
-        scheduler.step()
-        optimiser.zero_grad()
-
-    if accelerator.is_main_process:
-        accelerator.log({"loss": loss.item()})
-```
-
-### When to Use Which Strategy
-
-| Scenario | Recommendation |
-|----------|---------------|
-| Model fits on one GPU, want faster training | Data parallel (DDP) |
-| Model fits per GPU with Stage 1/2 | ZeRO Stage 2 — best performance/complexity trade-off |
-| Model does not fit even with Stage 2 | ZeRO Stage 3 or FSDP |
-| Prefer PyTorch-native, no DeepSpeed dependency | FSDP |
-| Very large models (70B+) across many nodes | Pipeline + tensor parallelism (Megatron-LM) |
 
 ---
 

@@ -12,72 +12,40 @@
 
 ### GPU Architecture
 
-```
-GPU
-└── Streaming Multiprocessors (SMs)
-    └── Warps (32 threads, execute in lockstep)
-        └── CUDA Cores (scalar FP/INT operations)
-        └── Tensor Cores (matrix multiply, FP16/BF16/FP8)
-```
+A GPU is composed of many **Streaming Multiprocessors (SMs)**. Each SM runs multiple **warps** — groups of 32 threads that execute the same instruction in lockstep. Within each SM there are:
 
-- **Warp**: the fundamental execution unit — 32 threads that run the same instruction simultaneously
-- **Occupancy**: how many warps are active on an SM at once — limited by registers and shared memory
-- **Tensor Cores**: perform 4×4 or 16×16 matrix multiply-accumulate in a single clock — critical for attention and linear layers
+- **CUDA Cores**: scalar floating-point and integer operations
+- **Tensor Cores**: perform matrix multiply-accumulate on small tiles (e.g. 16×16) in a single clock — critical for attention and linear layers
+- **Occupancy**: the fraction of maximum possible warps that are active on an SM — limited by register and shared memory usage
 
 ### Memory Hierarchy
 
-```
-HBM (High Bandwidth Memory) — ~3 TB/s, ~80 GB on A100
-    │
-    ▼
-L2 Cache — ~40 MB, shared across all SMs
-    │
-    ▼
-L1 Cache / Shared Memory — ~192 KB per SM, programmer-controlled
-    │
-    ▼
-Registers — fastest, private to each thread
-```
+From slowest/largest to fastest/smallest:
 
-- **The key insight**: most GPU operations are *memory-bandwidth bound* — the bottleneck is reading data from HBM, not compute
-- **Roofline model**: plots achievable FLOPS vs arithmetic intensity (FLOPS/byte) — tells you whether a kernel is memory or compute bound
+| Level | Bandwidth | Capacity | Scope |
+|-------|-----------|----------|-------|
+| HBM (High Bandwidth Memory) | ~3 TB/s | ~80 GB (A100) | All SMs |
+| L2 Cache | ~6 TB/s | ~40 MB | All SMs |
+| L1 / Shared Memory | ~20 TB/s | ~192 KB per SM | Threads in a block |
+| Registers | Fastest | Very limited | Individual threads |
 
-### Roofline Analysis
+**The key insight**: most GPU operations are *memory-bandwidth bound* — the bottleneck is moving data from HBM, not performing FLOPs.
 
-```
-        │              /
-TFLOPS  │             / compute bound
-        │            /
- peak   │───────────/──────────────── peak compute
-compute │          /
-        │         /
-        │        /  memory bound
-        │       /
-        └──────────────────────────►
-               arithmetic intensity (FLOPS/byte)
-```
+### Roofline Model
 
-- Move operations to the right (fuse operations, reduce memory accesses) to escape memory-bound territory
+The roofline model plots achievable performance (TFLOPS) against arithmetic intensity (FLOPS per byte of memory traffic):
+
+- **Memory-bound region**: performance scales with memory bandwidth — moving operations left to right (reducing memory traffic) helps
+- **Compute-bound region**: performance is capped by peak TFLOPS — only algorithmic improvements or more compute helps
+- **Kernel fusion** moves operations to the right by eliminating intermediate writes to HBM
 
 ### CUDA Programming Model
 
-```
-kernel<<<grid, block>>>(args)
+Kernels are launched with a grid of thread blocks. Each block contains up to 1024 threads, organised along x/y/z dimensions. Threads within a block share L1 / shared memory and can synchronise with `__syncthreads()`.
 
-grid  = (Bx, By, Bz)   — number of blocks
-block = (Tx, Ty, Tz)   — threads per block (max 1024)
-
-thread ID:  threadIdx.{x,y,z}
-block ID:   blockIdx.{x,y,z}
-block dim:  blockDim.{x,y,z}
-```
-
-- **Shared memory**: declared with `__shared__`, lives in L1, visible to all threads in a block — use to avoid repeated HBM reads
-- **Bank conflicts**: shared memory is divided into 32 banks — simultaneous accesses to the same bank serialise; avoid by padding
-
-### Warp Divergence
-
-When threads in a warp take different branches of an `if` statement, both branches execute serially and inactive threads are masked out — called **warp divergence**. Minimise branching within a warp.
+- **Shared memory**: programmer-controlled L1 — use it to cache data that multiple threads in a block need, avoiding repeated HBM reads
+- **Bank conflicts**: shared memory is divided into 32 banks — simultaneous accesses to the same bank serialise; avoid by padding arrays
+- **Warp divergence**: when threads in a warp take different branches of an `if` statement, both branches execute serially and inactive threads are masked — minimise branching within a warp
 
 ### Triton
 
@@ -87,6 +55,26 @@ Triton is a Python-based DSL for writing GPU kernels that compiles to PTX:
 - Handles thread indexing, shared memory management, and memory coalescing automatically
 - Much easier than raw CUDA while achieving near-cuBLAS performance for many kernels
 - Backed by an MLIR compiler — generates efficient PTX/SASS
+
+**Why fusion matters**: a fused softmax kernel reads the input once and writes the output once. A naïve implementation (separate exp, sum, divide) reads and writes to HBM three times — pure memory bandwidth waste.
+
+### Profiling Tools
+
+| Tool | What it Shows |
+|------|--------------|
+| `torch.profiler` | CPU + CUDA timeline, operator-level GPU time |
+| `nsys` (Nsight Systems) | System-wide GPU/CPU timeline, kernel launches, memory transfers |
+| `ncu` (Nsight Compute) | Per-kernel hardware metrics: memory throughput, compute throughput, occupancy, warp efficiency |
+
+#### Key `ncu` Metrics
+
+| Metric | What it Means |
+|--------|--------------|
+| Memory Throughput | How much of peak HBM bandwidth is being used |
+| Compute (SM) Throughput | How much of peak compute is being used |
+| Occupancy | Fraction of warps active — low = register/shared-memory pressure |
+| L1/TEX Cache Throughput | Cache hit rate for L1 |
+| Warp Efficiency | Fraction of active threads in active warps — low = warp divergence |
 
 ---
 
@@ -100,97 +88,6 @@ Triton is a Python-based DSL for writing GPU kernels that compiles to PTX:
 - [ ] Profile with `ncu` (Nsight Compute) — check memory bandwidth utilisation and occupancy
 - [ ] Replace a PyTorch operation with your custom Triton kernel in a small model — measure end-to-end speedup
 - [ ] Read and annotate the Flash Attention Triton implementation
-
----
-
-## Key Code Patterns
-
-### Triton Fused Softmax Kernel
-
-```python
-import triton
-import triton.language as tl
-import torch
-
-@triton.jit
-def softmax_kernel(
-    output_ptr, input_ptr,
-    input_row_stride, output_row_stride,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    row_start_ptr = input_ptr + row_idx * input_row_stride
-
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    input_ptrs = row_start_ptr + col_offsets
-    mask = col_offsets < n_cols
-
-    row = tl.load(input_ptrs, mask=mask, other=-float("inf"))
-
-    row_minus_max = row - tl.max(row, axis=0)
-    numerator = tl.exp(row_minus_max)
-    denominator = tl.sum(numerator, axis=0)
-    softmax_output = numerator / denominator
-
-    output_row_start_ptr = output_ptr + row_idx * output_row_stride
-    tl.store(output_row_start_ptr + col_offsets, softmax_output, mask=mask)
-
-
-def softmax(x: torch.Tensor) -> torch.Tensor:
-    """Fused softmax using a custom Triton kernel."""
-    n_rows, n_cols = x.shape
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    y = torch.empty_like(x)
-    softmax_kernel[(n_rows,)](
-        y, x,
-        x.stride(0), y.stride(0),
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return y
-```
-
-### Profiling with torch.profiler
-
-```python
-import torch
-from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
-
-with profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    record_shapes=True,
-    with_stack=True,
-    on_trace_ready=tensorboard_trace_handler("./profiler_logs"),
-) as prof:
-    for _ in range(10):
-        output = model(input_ids)
-
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-```
-
-### Profiling with Nsight Compute (CLI)
-
-```bash
-# Profile a single training step
-ncu --set full \
-    --target-processes all \
-    -o profile_report \
-    python train_step.py
-
-# Open in GUI
-ncu-ui profile_report.ncu-rep
-```
-
-### Key Things to Look For in ncu
-
-| Metric | What it Means |
-|--------|--------------|
-| `Memory Throughput` | How much of peak HBM bandwidth is being used |
-| `Compute (SM) Throughput` | How much of peak compute is being used |
-| `Occupancy` | Fraction of warps that are active — low = register/shared-memory pressure |
-| `L1/TEX Cache Throughput` | Cache hit rate for L1 |
-| `Warp Efficiency` | Fraction of active threads in active warps — low = warp divergence |
 
 ---
 

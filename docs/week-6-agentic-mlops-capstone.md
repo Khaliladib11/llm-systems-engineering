@@ -50,22 +50,6 @@ Microsoft's approach to synthetic agentic dataset generation:
 - [ ] Evaluate the agent on multi-step tasks — measure task completion rate
 - [ ] Implement a simple rule-based reward function for agentic task completion
 
-### Key Code Pattern: ReAct Agent with smolagents
-
-```python
-from smolagents import CodeAgent, DuckDuckGoSearchTool, HfApiModel
-
-model = HfApiModel(model_id="Qwen/Qwen2.5-7B-Instruct")
-
-agent = CodeAgent(
-    tools=[DuckDuckGoSearchTool()],
-    model=model,
-    max_steps=10,
-)
-
-result = agent.run("Find the latest research on speculative decoding for LLMs.")
-```
-
 ### Resources
 
 - [smolagents](https://github.com/huggingface/smolagents)
@@ -97,23 +81,7 @@ result = agent.run("Find the latest research on speculative decoding for LLMs.")
 
 #### Slurm for Multi-Node Training
 
-```bash
-#!/bin/bash
-#SBATCH --job-name=llm-train
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=8        # 8 GPUs per node
-#SBATCH --gres=gpu:8
-#SBATCH --time=48:00:00
-#SBATCH --partition=gpu
-
-srun torchrun \
-  --nnodes=$SLURM_NNODES \
-  --nproc_per_node=8 \
-  --rdzv_id=$SLURM_JOB_ID \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=$MASTER_ADDR:29500 \
-  train.py
-```
+Slurm is the standard HPC job scheduler. A multi-node training job is submitted with `sbatch`, specifying the number of nodes, GPUs per node, and walltime. `torchrun` is launched via `srun` so each node runs its own process group. The rendezvous backend (`c10d`) coordinates across nodes using a shared master address and port.
 
 #### Experiment Tracking with W&B
 
@@ -135,67 +103,6 @@ srun torchrun \
 - [ ] Set up a full W&B project: training run → model artifact → evaluation table
 - [ ] Write a simple Dockerfile for a training job
 - [ ] Set up Prometheus + Grafana to monitor GPU utilisation (optional but impressive)
-
-### Key Code Pattern: Dockerfile for Training
-
-```dockerfile
-FROM nvcr.io/nvidia/pytorch:24.05-py3
-
-WORKDIR /workspace
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-ENV PYTHONUNBUFFERED=1
-
-ENTRYPOINT ["python", "train.py"]
-```
-
-### Key Code Pattern: vLLM on Kubernetes
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: vllm-server
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: vllm
-  template:
-    metadata:
-      labels:
-        app: vllm
-    spec:
-      containers:
-        - name: vllm
-          image: vllm/vllm-openai:latest
-          args:
-            - "--model"
-            - "meta-llama/Llama-3-8B-Instruct"
-            - "--gpu-memory-utilization"
-            - "0.9"
-          resources:
-            limits:
-              nvidia.com/gpu: "1"
-          ports:
-            - containerPort: 8000
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: vllm-service
-spec:
-  selector:
-    app: vllm
-  ports:
-    - port: 8000
-      targetPort: 8000
-  type: ClusterIP
-```
 
 ### Resources
 
@@ -238,15 +145,7 @@ Run DPO or GRPO with a verifiable reward signal:
 
 #### Step 4 — Inference
 
-Serve the final merged model with vLLM:
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model ./final-model \
-  --port 8000
-```
-
-Expose an OpenAI-compatible API — test with the `openai` Python client.
+Serve the final merged model with vLLM, exposing an OpenAI-compatible API. Test with the `openai` Python client.
 
 #### Step 5 — Evaluation
 

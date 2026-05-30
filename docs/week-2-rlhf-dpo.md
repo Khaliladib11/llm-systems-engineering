@@ -12,22 +12,7 @@
 
 ### The RLHF Pipeline
 
-```
-Pre-trained LLM
-      │
-      ▼
-  SFT Model ──────────────────────────────────┐
-      │                                        │
-      ▼                                        │
- Reward Model ◄── Human preference labels      │
-  (Bradley-Terry)                              │
-      │                                        │
-      ▼                                        ▼
-  PPO Training ◄── KL divergence penalty ◄── Reference model
-      │
-      ▼
- RLHF-aligned Model
-```
+Pre-trained LLM → SFT Model → Reward Model (trained on human preferences) → PPO Training (with KL divergence penalty against the reference SFT model) → RLHF-aligned Model
 
 ### PPO for LLMs
 
@@ -79,52 +64,6 @@ A preference dataset contains triplets: `(prompt, chosen, rejected)`:
 - [ ] Compare outputs: SFT-only vs DPO vs GRPO on the same prompts
 - [ ] Implement a simple rule-based reward function (e.g., reward correct format, penalise refusals)
 - [ ] Log all runs to W&B, compare reward scores across training steps
-
----
-
-## Key Code Patterns
-
-### DPO Training
-
-```python
-from trl import DPOTrainer, DPOConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model = AutoModelForCausalLM.from_pretrained("sft-checkpoint")
-ref_model = AutoModelForCausalLM.from_pretrained("sft-checkpoint")
-tokenizer = AutoTokenizer.from_pretrained("sft-checkpoint")
-
-trainer = DPOTrainer(
-    model=model,
-    ref_model=ref_model,
-    args=DPOConfig(
-        beta=0.1,              # KL penalty coefficient
-        output_dir="./dpo-output",
-        num_train_epochs=1,
-        per_device_train_batch_size=4,
-        report_to="wandb",
-    ),
-    train_dataset=preference_dataset,
-    tokenizer=tokenizer,
-)
-
-trainer.train()
-```
-
-### Simple Rule-Based Reward Function
-
-```python
-def format_reward(response: str) -> float:
-    """Score a response based on simple format rules."""
-    score = 0.0
-    if response.startswith("Sure"):
-        score -= 0.5   # penalise sycophantic openers
-    if len(response.split()) > 10:
-        score += 0.2   # reward substantive answers
-    if "I cannot" in response or "I'm unable" in response:
-        score -= 1.0   # penalise unnecessary refusals
-    return score
-```
 
 ---
 
